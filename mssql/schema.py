@@ -23,6 +23,8 @@ from django.db.models.sql.where import AND
 from django.db.transaction import TransactionManagementError
 from django.utils.encoding import force_str
 
+from collections import defaultdict
+
 if django_version >= (4, 0):
     from django.db.models.sql import Query
     from django.db.backends.ddl_references import Expressions
@@ -91,6 +93,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     sql_rename_table = "EXEC sp_rename %(old_table)s, %(new_table)s"
     sql_create_unique_null = "CREATE UNIQUE INDEX %(name)s ON %(table)s(%(columns)s) " \
                              "WHERE %(columns)s IS NOT NULL"
+    _deferred_unique_indexes = defaultdict(list)
 
     def _alter_column_default_sql(self, model, old_field, new_field, drop=False):
         """
@@ -275,6 +278,15 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             name=self.quote_name(name),
             include=''
         )
+
+    def _delete_deferred_unique_indexes_for_field(self, field):
+        deferred_statements = self._deferred_unique_indexes.get(str(field), [])
+        for stmt in deferred_statements:
+            if stmt in self.deferred_sql:
+                self.deferred_sql.remove(stmt)
+
+    def _add_deferred_unique_index_for_field(self, field, statement):
+        self._deferred_unique_indexes[str(field)].append(statement)
 
     def _alter_field(self, model, old_field, new_field, old_type, new_type,
                      old_db_params, new_db_params, strict=False):
@@ -519,6 +531,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                     self.execute(self._create_unique_sql(model, [new_field]))
                 else:
                     self.execute(self._create_unique_sql(model, [new_field.column]))
+
+            self._delete_deferred_unique_indexes_for_field(new_field)
+
         # Added an index?
         # constraint will no longer be used in lieu of an index. The following
         # lines from the truth table show all True cases; the rest are False:
@@ -550,6 +565,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                         self.execute(self._create_unique_sql(model, [old_field]))
                     else:
                         self.execute(self._create_unique_sql(model, columns=[old_field.column]))
+                self._delete_deferred_unique_indexes_for_field(old_field)
             else:
                 if django_version >= (4, 0):
                     for field_names in model._meta.unique_together:
@@ -749,9 +765,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 not field.many_to_many and field.null and field.unique):
 
             definition = definition.replace(' UNIQUE', '')
-            self.deferred_sql.append(self._create_index_sql(
+            statement = self._create_index_sql(
                 model, [field], sql=self.sql_create_unique_null, suffix="_uniq"
-            ))
+            )
+            self.deferred_sql.append(statement)
+            self._add_deferred_unique_index_for_field(field, statement)
 
         # Check constraints can go on the column SQL here
         db_params = field.db_parameters(connection=self.connection)
@@ -915,9 +933,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                     not field.many_to_many and field.null and field.unique):
 
                 definition = definition.replace(' UNIQUE', '')
-                self.deferred_sql.append(self._create_index_sql(
+                statement = self._create_index_sql(
                     model, [field], sql=self.sql_create_unique_null, suffix="_uniq"
-                ))
+                )
+                self.deferred_sql.append(statement)
+                self._add_deferred_unique_index_for_field(field, statement)
 
             # Check constraints can go on the column SQL here
             db_params = field.db_parameters(connection=self.connection)
